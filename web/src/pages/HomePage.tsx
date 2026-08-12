@@ -1,26 +1,24 @@
-import { useEffect, useState } from 'react'
-import { api, formatBytes, type SystemStatus } from '../api'
+import { useCallback, useEffect, useState } from 'react'
+import { api, formatBytes, type SystemStatus, type Video } from '../api'
 import { ErrorBox, Panel, Stat } from '../components/ui'
+import { UploadZone } from '../components/UploadZone'
+import { VideoPanel } from '../components/VideoPanel'
 
 export function HomePage() {
   const [status, setStatus] = useState<SystemStatus | null>(null)
+  const [videos, setVideos] = useState<Video[]>([])
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    let alive = true
-    const load = () => {
-      api
-        .systemStatus()
-        .then((s) => alive && (setStatus(s), setError(null)))
-        .catch((e) => alive && setError(String(e.message ?? e)))
-    }
-    load()
-    const timer = setInterval(load, 15000)
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
+  const reload = useCallback(() => {
+    api.systemStatus().then(setStatus).catch((e) => setError(String(e.message ?? e)))
+    api.listVideos().then(setVideos).catch((e) => setError(String(e.message ?? e)))
   }, [])
+
+  useEffect(() => {
+    reload()
+    const timer = setInterval(reload, 15000)
+    return () => clearInterval(timer)
+  }, [reload])
 
   const free = status?.disk.free ?? 0
   const diskTone = free < 1.5 * 1024 ** 3 ? 'bad' : free < 3 * 1024 ** 3 ? 'warn' : 'ok'
@@ -34,10 +32,7 @@ export function HomePage() {
       <Panel title="Состояние системы">
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <Stat label="Свободно на диске" value={formatBytes(free)} tone={diskTone} />
-          <Stat
-            label="Занято"
-            value={status ? formatBytes(status.disk.used) : '—'}
-          />
+          <Stat label="Занято" value={status ? formatBytes(status.disk.used) : '—'} />
           <Stat
             label="Максимум для серии"
             value={status ? formatBytes(status.max_source_bytes) : '—'}
@@ -54,7 +49,6 @@ export function HomePage() {
             Не удалось получить баланс: {status.balance_error}
           </p>
         )}
-
         {balance != null && balance < 150 && (
           <p className="mt-3 text-xs text-[var(--color-warn)]">
             Баланса хватит примерно на {Math.floor(balance / 2)} минут распознавания речи.
@@ -64,10 +58,18 @@ export function HomePage() {
       </Panel>
 
       <Panel title="Загрузка серии">
-        <p className="text-sm text-neutral-400">
-          Загрузка видео и запуск обработки подключаются на следующем этапе.
-        </p>
+        <UploadZone maxBytes={status?.max_source_bytes ?? 0} onUploaded={reload} />
       </Panel>
+
+      {videos.map((video) => (
+        <VideoPanel key={video.id} video={video} onChanged={reload} />
+      ))}
+
+      {videos.length === 0 && (
+        <p className="text-sm text-neutral-500 px-1">
+          Загруженных серий пока нет.
+        </p>
+      )}
     </div>
   )
 }

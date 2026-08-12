@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import DATA_DIR, ensure_dirs, max_upload_bytes
 from .db import get_settings, init_db, set_settings
+from .routes import jobs as jobs_routes
+from .routes import videos as videos_routes
 from .services import genapi
 
 app = FastAPI(title="Shorts Cutter", version="0.1.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -66,5 +68,8 @@ def update_settings(values: dict[str, str]) -> dict[str, str]:
     set_settings(values)
     return get_settings()
 
+
+api.include_router(videos_routes.router)
+api.include_router(jobs_routes.router)
 
 app.include_router(api)

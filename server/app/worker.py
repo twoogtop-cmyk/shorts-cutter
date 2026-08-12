@@ -6,10 +6,11 @@ import json
 import logging
 import signal
 import time
-from typing import Any, Callable
+from typing import Any
 
 from .config import ensure_dirs
 from .db import init_db
+from .registry import HANDLERS
 from .services import queue
 
 logging.basicConfig(
@@ -19,17 +20,6 @@ logging.basicConfig(
 log = logging.getLogger("worker")
 
 _running = True
-
-# Обработчики задач регистрируются здесь по мере готовности этапов.
-HANDLERS: dict[str, Callable[[dict[str, Any]], None]] = {}
-
-
-def register(job_type: str) -> Callable[[Callable[[dict[str, Any]], None]], Callable[[dict[str, Any]], None]]:
-    def wrapper(fn: Callable[[dict[str, Any]], None]) -> Callable[[dict[str, Any]], None]:
-        HANDLERS[job_type] = fn
-        return fn
-
-    return wrapper
 
 
 def _stop(signum: int, frame: Any) -> None:  # noqa: ARG001
@@ -58,12 +48,24 @@ def run_job(job: dict[str, Any]) -> None:
     if queue.is_cancelled(job_id):
         queue.finish_job(job_id, "canceled")
         queue.log(job_id, "задача отменена")
+        # Видео не должно остаться в промежуточном статусе после отмены.
+        if job.get("video_id"):
+            from .db import execute
+
+            execute(
+                "UPDATE videos SET status='uploaded', updated_at=datetime('now') "
+                "WHERE id=? AND status NOT IN ('failed','completed')",
+                (job["video_id"],),
+            )
     else:
         queue.finish_job(job_id, "done")
         queue.log(job_id, "задача завершена")
 
 
 def main() -> None:
+    # Импорт здесь, а не наверху: модуль задач импортирует register из этого файла.
+    from . import tasks  # noqa: F401
+
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     ensure_dirs()
