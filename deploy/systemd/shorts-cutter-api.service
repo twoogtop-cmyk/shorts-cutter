@@ -1,0 +1,17 @@
+[Unit]
+Description=Shorts Cutter API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/shorts-cutter
+EnvironmentFile=/etc/shorts-cutter/env
+ExecStart=/opt/shorts-cutter/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+# Один воркер и лимит памяти: на сервере 956 МБ RAM, рядом работают
+# worker с OpenCV и ffmpeg.
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

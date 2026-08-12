@@ -1,0 +1,18 @@
+[Unit]
+Description=Shorts Cutter Worker
+After=network.target shorts-cutter-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/shorts-cutter
+EnvironmentFile=/etc/shorts-cutter/env
+ExecStart=/opt/shorts-cutter/venv/bin/python -m app.worker
+Restart=always
+RestartSec=5
+# Worker поднимает OpenCV и запускает ffmpeg; лимит защищает систему от OOM.
+MemoryMax=600M
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
