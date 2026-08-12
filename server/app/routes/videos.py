@@ -35,6 +35,13 @@ def video_dict(row) -> dict:
     tracks = data.pop("audio_tracks_json", None)
     data["audio_tracks"] = json.loads(tracks) if tracks else []
     data.pop("probe_json", None)
+    # Исходник раздаётся nginx напрямую из /media — плееру в браузере
+    # нужен URL, а не путь на диске.
+    storage = data.get("storage_path")
+    data["media_url"] = f"/media/sources/{Path(storage).name}" if storage else None
+    data["segments_count"] = (
+        query_one("SELECT COUNT(*) AS n FROM segments WHERE video_id=?", (data["id"],)) or {"n": 0}
+    )["n"]
     return data
 
 

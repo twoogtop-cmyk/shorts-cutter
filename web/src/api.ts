@@ -44,6 +44,25 @@ export type Video = {
   audio_tracks: AudioTrack[]
   error: string | null
   created_at: string
+  media_url: string | null
+  segments_count: number
+}
+
+export type Segment = {
+  id: number
+  idx?: number
+  start: number
+  end: number
+  text: string
+  speaker: string | null
+}
+
+export type Transcript = {
+  video_id: number
+  duration: number | null
+  segments: Segment[]
+  speakers: string[]
+  count: number
 }
 
 export type Job = {
@@ -76,6 +95,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(audioTrack == null ? {} : { audio_track: audioTrack }),
     }),
+
+  getTranscript: (videoId: number) => request<Transcript>(`/api/videos/${videoId}/transcript`),
+  searchTranscript: (videoId: number, q: string) =>
+    request<{ query: string; results: Segment[] }>(
+      `/api/videos/${videoId}/transcript/search?q=${encodeURIComponent(q)}`,
+    ),
+  transcribeSample: (videoId: number, start: number, minutes: number) =>
+    request<{ job_id: number; start: number; end: number; cost_estimate: number }>(
+      `/api/videos/${videoId}/transcript/sample`,
+      { method: 'POST', body: JSON.stringify({ start, minutes }) },
+    ),
 
   activeJobs: () => request<Job[]>('/api/jobs/active'),
   listJobs: (videoId?: number) =>

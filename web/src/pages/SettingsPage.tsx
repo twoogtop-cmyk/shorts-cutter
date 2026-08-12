@@ -150,6 +150,70 @@ export function SettingsPage() {
           </Field>
         </div>
       </Panel>
+
+      <Panel title="Финальная плашка">
+        <p className="text-xs text-neutral-500 mb-4">
+          Компактный текст по центру кадра в последние секунды шортса — например призыв
+          подписаться. Показывается поверх видео, не перекрывая субтитры.
+        </p>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <Field label="Показывать">
+            <select
+              className={inputClass}
+              value={values.outro_enabled}
+              onChange={(e) => set('outro_enabled', e.target.value)}
+            >
+              <option value="0">Выключено</option>
+              <option value="1">Включено</option>
+            </select>
+          </Field>
+
+          <Field label="Длительность, сек">
+            <input
+              className={inputClass}
+              type="number"
+              min={1}
+              max={10}
+              step="0.5"
+              value={values.outro_duration}
+              onChange={(e) => set('outro_duration', e.target.value)}
+            />
+          </Field>
+
+          <Field label="Размер шрифта">
+            <input
+              className={inputClass}
+              type="number"
+              min={24}
+              max={140}
+              value={values.outro_font_size}
+              onChange={(e) => set('outro_font_size', e.target.value)}
+            />
+          </Field>
+
+          <Field label="Затемнение подложки, %" hint="0 — без подложки">
+            <input
+              className={inputClass}
+              type="number"
+              min={0}
+              max={100}
+              value={values.outro_bg_opacity}
+              onChange={(e) => set('outro_bg_opacity', e.target.value)}
+            />
+          </Field>
+
+          <div className="sm:col-span-2 lg:col-span-4">
+            <Field label="Текст" hint="Перенос строки — новая строка на видео">
+              <textarea
+                className={`${inputClass} min-h-[80px] resize-y`}
+                value={values.outro_text}
+                placeholder={'Подпишись\nчтобы не пропустить продолжение'}
+                onChange={(e) => set('outro_text', e.target.value)}
+              />
+            </Field>
+          </div>
+        </div>
+      </Panel>
     </div>
   )
 }

@@ -193,7 +193,19 @@ DEFAULT_SETTINGS = {
     "pad_end": "0.5",
     "quality_profile": "high",
     "llm_model": "claude-sonnet-4-5",
+    # Финальная плашка: компактный текст по центру в последние секунды шортса.
+    "outro_enabled": "0",
+    "outro_text": "",
+    "outro_duration": "3",
+    "outro_font_size": "64",
+    "outro_bg_opacity": "60",
 }
+
+# Колонки, добавленные после первого выпуска схемы.
+MIGRATIONS = [
+    ("candidates", "outro_text", "TEXT"),
+    ("candidates", "outro_enabled", "INTEGER"),
+]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -219,6 +231,11 @@ def init_db() -> None:
     except sqlite3.OperationalError:
         # Сборка SQLite без FTS5 — поиск по диалогам сделаем через LIKE.
         pass
+    for table, column, coltype in MIGRATIONS:
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
 
