@@ -77,6 +77,31 @@ export type Job = {
   logs?: { ts: string; level: string; message: string }[]
 }
 
+export type Candidate = {
+  id: number
+  video_id: number
+  start: number
+  end: number
+  duration: number
+  title: string | null
+  category: string | null
+  hook_score: number | null
+  retention_score: number | null
+  context_score: number | null
+  emotion_score: number | null
+  ending_score: number | null
+  total_score: number | null
+  ai_reason: string | null
+  transcript_text: string | null
+  status: string
+  origin: string
+  preview_url: string | null
+  render_url: string | null
+  crop_mode: string | null
+  subtitles_enabled: number | null
+  banner_id: number | null
+}
+
 export const api = {
   systemStatus: () => request<SystemStatus>('/api/system/status'),
   getSettings: () => request<Settings>('/api/settings'),
@@ -106,6 +131,25 @@ export const api = {
       `/api/videos/${videoId}/transcript/sample`,
       { method: 'POST', body: JSON.stringify({ start, minutes }) },
     ),
+
+  listCandidates: (videoId?: number) =>
+    request<Candidate[]>(`/api/candidates${videoId ? `?video_id=${videoId}` : ''}`),
+  updateCandidate: (id: number, patch: Partial<Candidate>) =>
+    request<Candidate>(`/api/candidates/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  bulkCandidates: (ids: number[], status: string) =>
+    request<{ updated: number }>('/api/candidates/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ ids, status }),
+    }),
+  deleteCandidate: (id: number) =>
+    request<{ ok: boolean }>(`/api/candidates/${id}`, { method: 'DELETE' }),
+  findMoments: (videoId: number) =>
+    request<{ job_id: number }>(`/api/candidates/find/${videoId}`, { method: 'POST' }),
+  createManual: (videoId: number, start: number, end: number, title?: string) =>
+    request<Candidate>('/api/candidates/manual', {
+      method: 'POST',
+      body: JSON.stringify({ video_id: videoId, start, end, title }),
+    }),
 
   activeJobs: () => request<Job[]>('/api/jobs/active'),
   listJobs: (videoId?: number) =>

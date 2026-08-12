@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import AUDIO_DIR, STT_CHUNK_SECONDS, TMP_DIR
-from .db import execute, get_settings, insert, query_one
-from .services import ffmpeg, queue, stt
+from .db import execute, get_settings, insert, query, query_one
+from .services import analysis, ffmpeg, genapi, queue, stt
 from .registry import register
 
 
@@ -197,6 +197,98 @@ def handle_transcribe_sample(job: dict[str, Any]) -> None:
         raise
 
 
+def run_scene_detection(video_id: int, job_id: int) -> list[float]:
+    """Находит монтажные склейки — по ним уточняется начало шортса."""
+    video = _video(video_id)
+    source = Path(video["storage_path"])
+
+    _set_status(video_id, "scene_detection")
+    queue.set_progress(job_id, 0, "scene_detection")
+
+    scenes = ffmpeg.detect_scenes(
+        source,
+        duration=video["duration"],
+        on_progress=lambda frac: queue.set_progress(job_id, int(frac * 100), "scene_detection"),
+        should_cancel=lambda: queue.is_cancelled(job_id),
+    )
+
+    execute("DELETE FROM scenes WHERE video_id=?", (video_id,))
+    previous = 0.0
+    for cut in scenes:
+        insert("INSERT INTO scenes(video_id, start, end) VALUES (?, ?, ?)", (video_id, previous, cut))
+        previous = cut
+    duration = float(video["duration"] or 0)
+    if duration > previous:
+        insert("INSERT INTO scenes(video_id, start, end) VALUES (?, ?, ?)", (video_id, previous, duration))
+
+    queue.log(job_id, f"найдено склеек: {len(scenes)}")
+    return scenes
+
+
+def run_ai_analysis(video_id: int, job_id: int) -> int:
+    """Ищет интересные моменты и сохраняет их как кандидатов."""
+    settings = get_settings()
+    segments = [
+        dict(r)
+        for r in query(
+            "SELECT id, start, end, text, speaker FROM segments WHERE video_id=? ORDER BY start",
+            (video_id,),
+        )
+    ]
+    if not segments:
+        raise RuntimeError("Нет транскрипции — сначала нужно распознать речь")
+
+    scenes = [r["end"] for r in query("SELECT end FROM scenes WHERE video_id=? ORDER BY start", (video_id,))]
+
+    _set_status(video_id, "ai_analysis")
+    queue.set_progress(job_id, 10, "ai_analysis")
+
+    moments = analysis.find_moments(
+        segments=segments,
+        scenes=scenes,
+        settings=settings,
+        model=settings.get("llm_model", "claude-sonnet-4-5"),
+        chat_fn=lambda messages, model: genapi.chat(messages, model=model),
+        on_log=lambda msg: queue.log(job_id, msg),
+    )
+
+    queue.set_progress(job_id, 80, "ai_analysis")
+    execute("DELETE FROM candidates WHERE video_id=? AND origin='ai' AND status='candidate'", (video_id,))
+
+    for moment in moments:
+        insert(
+            "INSERT INTO candidates(video_id, start, end, title, category, hook_score, "
+            "retention_score, context_score, emotion_score, ending_score, total_score, "
+            "ai_reason, transcript_text, status, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 'ai')",
+            (
+                video_id, moment["start"], moment["end"], moment["title"], moment["category"],
+                moment["hook_score"], moment["retention_score"], moment["context_score"],
+                moment["emotion_score"], moment["ending_score"], moment["total_score"],
+                moment["ai_reason"], moment["transcript_text"],
+            ),
+        )
+
+    queue.log(job_id, f"отобрано моментов: {len(moments)}")
+    return len(moments)
+
+
+@register("find_moments")
+def handle_find_moments(job: dict[str, Any]) -> None:
+    """Поиск моментов по уже готовой транскрипции — без повторной оплаты распознавания."""
+    video_id = job["video_id"]
+    job_id = job["id"]
+    try:
+        if not query_one("SELECT 1 FROM scenes WHERE video_id=? LIMIT 1", (video_id,)):
+            run_scene_detection(video_id, job_id)
+        run_ai_analysis(video_id, job_id)
+        _set_status(video_id, "analyzed")
+        queue.set_progress(job_id, 100, "ai_analysis")
+    except Exception as exc:
+        _set_status(video_id, "transcribed", str(exc)[:1000])
+        raise
+
+
 @register("analyze")
 def handle_analyze(job: dict[str, Any]) -> None:
     """Полный разбор серии. Стадии добавляются по мере готовности этапов."""
@@ -218,9 +310,15 @@ def handle_analyze(job: dict[str, Any]) -> None:
             _set_status(video_id, "audio_ready")
             return
 
-        # Поиск сцен и анализ интересных моментов подключаются на этапе 4.
-        _set_status(video_id, "transcribed")
-        queue.set_progress(job_id, 100, "transcribing")
+        run_scene_detection(video_id, job_id)
+        if queue.is_cancelled(job_id):
+            _set_status(video_id, "transcribed")
+            return
+
+        run_ai_analysis(video_id, job_id)
+        # Нарезка превью подключается на этапе 5.
+        _set_status(video_id, "analyzed")
+        queue.set_progress(job_id, 100, "ai_analysis")
     except Exception as exc:
         _set_status(video_id, "failed", str(exc)[:1000])
         raise

@@ -182,28 +182,32 @@ def split_audio(source: Path, target_dir: Path, chunk_seconds: int) -> list[tupl
 
 def detect_scenes(
     source: Path,
-    threshold: float = 0.4,
+    threshold: float = 0.12,
     duration: float | None = None,
     on_progress: Callable[[float], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[float]:
     """Возвращает моменты монтажных склеек (в секундах).
 
-    Анализ идёт по уменьшенному кадру: на одном ядре полное разрешение
-    обрабатывалось бы кратно дольше без пользы для точности.
+    Кадр уменьшается до 320 px: на одном ядре полное разрешение считалось бы
+    кратно дольше без пользы для точности. Печатаются только кадры-склейки —
+    иначе вывод на часовой серии составил бы сотни тысяч строк.
     """
     times: list[float] = []
-    scene_re = re.compile(r"lavfi\.scd\.time: ([\d.]+)")
+    time_re = re.compile(r"pts_time:([\d.]+)")
 
     def collect(line: str) -> None:
-        match = scene_re.search(line)
+        match = time_re.search(line)
         if match:
-            times.append(float(match.group(1)))
+            times.append(round(float(match.group(1)), 3))
 
     run(
         [
             "-i", str(source),
-            "-filter_complex", f"[0:v]scale=320:-2,scdet=threshold={threshold * 100}",
+            "-filter_complex",
+            # Вывод направлен в stderr: run() читает именно его.
+            f"[0:v]scale=320:-2,select=gt(scene\\,{threshold}),"
+            f"metadata=print:file=/dev/stderr",
             "-f", "null", "-",
         ],
         total_duration=duration,
