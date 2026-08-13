@@ -186,6 +186,141 @@ def deduplicate(moments: list[dict[str, Any]], overlap_ratio: float = 0.5) -> li
     return sorted(kept, key=lambda m: m["start"])
 
 
+ACTION_PROMPT = """Ниже отрезки сериала, найденные по картинке и звуку: там частый монтаж,
+громкий звук и почти нет речи. Обычно это драка, погоня, битва или другое действие.
+
+Для каждого отрезка дан диалог до и после — по нему понятно, что происходит.
+
+{fragments}
+
+Оцени каждый отрезок как самостоятельный вертикальный ролик и верни ТОЛЬКО JSON:
+
+{{"moments": [
+  {{
+    "index": номер отрезка из списка,
+    "keep": true или false,
+    "title": "короткий заголовок до 60 символов",
+    "category": "Экшен, Напряжённый момент или другая подходящая",
+    "hook": 0-100,
+    "retention": 0-100,
+    "clarity": 0-100,
+    "emotion": 0-100,
+    "ending": 0-100,
+    "reason": "1-2 предложения"
+  }}
+]}}
+
+keep = false, если отрезок бессмысленно смотреть отдельно: это переход между сценами,
+заставка, титры, панорама без события. Действие должно быть понятно без остальной серии."""
+
+
+def build_action_prompt(
+    windows: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    context_seconds: float = 30.0,
+) -> str:
+    """Описывает найденные отрезки вместе с репликами вокруг них."""
+    blocks = []
+    for i, window in enumerate(windows, start=1):
+        before = [
+            s for s in segments
+            if window["start"] - context_seconds <= s["end"] <= window["start"]
+        ][-4:]
+        after = [
+            s for s in segments
+            if window["end"] <= s["start"] <= window["end"] + context_seconds
+        ][:4]
+        inside = [
+            s for s in segments
+            if s["start"] >= window["start"] and s["end"] <= window["end"]
+        ]
+
+        def lines(items: list[dict[str, Any]]) -> str:
+            return "\n".join(f"  {speaker_label(s.get('speaker'))}: {s['text']}" for s in items) or "  —"
+
+        blocks.append(
+            f"Отрезок {i}: {window['start']:.1f}–{window['end']:.1f} сек "
+            f"({window['end'] - window['start']:.0f} с)\n"
+            f"Реплики до:\n{lines(before)}\n"
+            f"Внутри отрезка:\n{lines(inside)}\n"
+            f"Реплики после:\n{lines(after)}"
+        )
+    return "\n\n".join(blocks)
+
+
+def evaluate_action_windows(
+    windows: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    settings: dict[str, str],
+    model: str,
+    chat_fn,
+    on_log=None,
+) -> list[dict[str, Any]]:
+    """Просит модель оценить найденные по звуку и монтажу отрезки."""
+    if not windows:
+        return []
+
+    min_score = float(settings.get("min_score", 70))
+    raw = chat_fn(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT.format(categories=", ".join(CATEGORIES))},
+            {
+                "role": "user",
+                "content": ACTION_PROMPT.format(
+                    fragments=build_action_prompt(windows, segments)
+                ),
+            },
+        ],
+        model=model,
+    )
+
+    parsed = parse_response(raw)
+    if on_log:
+        on_log(f"модель оценила экшен-отрезков: {len(parsed)}")
+
+    results: list[dict[str, Any]] = []
+    for moment in parsed:
+        try:
+            index = int(moment.get("index", 0)) - 1
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= len(windows):
+            continue
+        if not moment.get("keep", True):
+            if on_log:
+                on_log(f"отрезок {index + 1} отклонён моделью: не смотрится отдельно")
+            continue
+
+        total = score_moment(moment)
+        if total < min_score:
+            if on_log:
+                on_log(f"отрезок {index + 1} отклонён: оценка {total} ниже порога")
+            continue
+
+        window = windows[index]
+        inner = [
+            s for s in segments
+            if s["start"] >= window["start"] and s["end"] <= window["end"]
+        ]
+        results.append(
+            {
+                "start": round(window["start"], 2),
+                "end": round(window["end"], 2),
+                "title": str(moment.get("title") or "Экшен-сцена")[:120],
+                "category": str(moment.get("category") or "Экшен")[:60],
+                "hook_score": int(moment.get("hook") or 0),
+                "retention_score": int(moment.get("retention") or 0),
+                "context_score": int(moment.get("clarity") or 0),
+                "emotion_score": int(moment.get("emotion") or 0),
+                "ending_score": int(moment.get("ending") or 0),
+                "total_score": total,
+                "ai_reason": str(moment.get("reason") or "")[:1000],
+                "transcript_text": build_transcript_text(inner),
+            }
+        )
+    return results
+
+
 def find_moments(
     segments: list[dict[str, Any]],
     scenes: list[float],

@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import AUDIO_DIR, PREVIEWS_DIR, RENDERS_DIR, STT_CHUNK_SECONDS, TMP_DIR
 from .db import execute, get_settings, insert, query, query_one
-from .services import analysis, ffmpeg, genapi, queue, render, stt
+from .services import action, analysis, ffmpeg, genapi, queue, render, stt
 from .registry import register
 
 
@@ -294,6 +294,119 @@ def run_ai_analysis(video_id: int, job_id: int) -> int:
     return len(moments)
 
 
+def run_action_search(video_id: int, job_id: int) -> int:
+    """Ищет боевые и другие бессловесные сцены — их не видно по транскрипции."""
+    settings = get_settings()
+    if settings.get("find_action", "1") in ("0", "", "None"):
+        return 0
+
+    video = _video(video_id)
+    audio_path = Path(video["audio_path"] or "")
+    if not audio_path.exists():
+        queue.log(job_id, "нет аудио — поиск экшена пропущен", "error")
+        return 0
+
+    scenes = [r["end"] for r in query("SELECT end FROM scenes WHERE video_id=? ORDER BY start", (video_id,))]
+    segments = [
+        dict(r)
+        for r in query(
+            "SELECT start, end, text, speaker FROM segments WHERE video_id=? ORDER BY start",
+            (video_id,),
+        )
+    ]
+    if not scenes:
+        return 0
+
+    queue.set_progress(job_id, 20, "ai_analysis")
+    queue.log(job_id, "ищем экшен-сцены по монтажу и звуку")
+
+    profile = action.loudness_profile(
+        audio_path, should_cancel=lambda: queue.is_cancelled(job_id)
+    )
+    duration = float(video["duration"] or 0)
+
+    windows = action.find_action_windows(
+        scenes,
+        profile,
+        segments,
+        duration=duration,
+        min_duration=float(settings.get("min_duration", 20)),
+        max_duration=float(settings.get("max_duration", 90)),
+    )
+
+    skip = float(settings.get("skip_service_seconds", 180))
+    windows = [
+        w for w in windows
+        if not action.is_service_fragment(w, duration, segments, skip_intro=skip, skip_outro=skip)
+    ]
+    if not windows:
+        queue.log(job_id, "экшен-сцены не найдены")
+        return 0
+
+    pad_start = float(settings.get("pad_start", 0.3))
+    pad_end = float(settings.get("pad_end", 0.5))
+    for window in windows:
+        window["start"], window["end"] = action.snap_action_bounds(
+            window, scenes, segments, pad_start, pad_end,
+            max_duration=float(settings.get('max_duration', 90)),
+        )
+
+    windows = windows[:8]
+    queue.log(job_id, f"отрезков-кандидатов на экшен: {len(windows)}")
+
+    moments = analysis.evaluate_action_windows(
+        windows=windows,
+        segments=segments,
+        settings=settings,
+        model=settings.get("llm_model", "claude-sonnet-4-5"),
+        chat_fn=lambda messages, model: genapi.chat(messages, model=model),
+        on_log=lambda msg: queue.log(job_id, msg),
+    )
+
+    existing = [
+        {"start": r["start"], "end": r["end"]}
+        for r in query("SELECT start, end FROM candidates WHERE video_id=?", (video_id,))
+    ]
+    saved = 0
+    for moment in moments:
+        duplicate = False
+        for other in existing:
+            overlap = min(moment["end"], other["end"]) - max(moment["start"], other["start"])
+            shorter = min(moment["end"] - moment["start"], other["end"] - other["start"])
+            if overlap > 0 and shorter > 0 and overlap / shorter >= 0.5:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        insert(
+            "INSERT INTO candidates(video_id, start, end, title, category, hook_score, "
+            "retention_score, context_score, emotion_score, ending_score, total_score, "
+            "ai_reason, transcript_text, status, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 'action')",
+            (
+                video_id, moment["start"], moment["end"], moment["title"], moment["category"],
+                moment["hook_score"], moment["retention_score"], moment["context_score"],
+                moment["emotion_score"], moment["ending_score"], moment["total_score"],
+                moment["ai_reason"], moment["transcript_text"],
+            ),
+        )
+        existing.append({"start": moment["start"], "end": moment["end"]})
+        saved += 1
+
+    queue.log(job_id, f"добавлено экшен-моментов: {saved}")
+    return saved
+
+
+@register("find_action")
+def handle_find_action(job: dict[str, Any]) -> None:
+    """Поиск экшена отдельной задачей — по уже готовой транскрипции и сценам."""
+    video_id = job["video_id"]
+    count = run_action_search(video_id, job["id"])
+    if count:
+        run_previews(video_id, job["id"])
+    queue.set_progress(job["id"], 100, "ai_analysis")
+
+
 @register("find_moments")
 def handle_find_moments(job: dict[str, Any]) -> None:
     """Поиск моментов по уже готовой транскрипции — без повторной оплаты распознавания."""
@@ -515,6 +628,13 @@ def handle_analyze(job: dict[str, Any]) -> None:
         if queue.is_cancelled(job_id):
             _set_status(video_id, "analyzed")
             return
+
+        try:
+            run_action_search(video_id, job_id)
+        except Exception as exc:
+            # Экшен — дополнение к основному поиску: его сбой не должен
+            # обесценивать уже найденные диалоговые моменты.
+            queue.log(job_id, f"поиск экшен-сцен не выполнен: {exc}", "error")
 
         run_previews(video_id, job_id)
         _set_status(video_id, "completed")

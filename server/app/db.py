@@ -200,6 +200,8 @@ DEFAULT_SETTINGS = {
     "outro_font_size": "64",
     "outro_bg_opacity": "60",
     "outro_position": "auto",
+    "find_action": "1",
+    "skip_service_seconds": "180",
 }
 
 # Колонки, добавленные после первого выпуска схемы.
