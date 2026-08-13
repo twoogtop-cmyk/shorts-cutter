@@ -369,6 +369,7 @@ def _build_request(candidate: dict[str, Any], video: dict[str, Any], kind: str) 
         outro_duration=float(settings.get("outro_duration", 3)),
         outro_font_size=int(float(settings.get("outro_font_size", 64))),
         outro_bg_opacity=float(settings.get("outro_bg_opacity", 60)),
+        outro_position=settings.get("outro_position", "auto"),
         work_dir=TMP_DIR,
     )
 

@@ -191,6 +191,22 @@ export function SettingsPage() {
             />
           </Field>
 
+          <Field
+            label="Положение"
+            hint="Авто — плашка встаёт туда, где не закроет лицо"
+          >
+            <select
+              className={inputClass}
+              value={values.outro_position}
+              onChange={(e) => set('outro_position', e.target.value)}
+            >
+              <option value="auto">Авто — мимо лиц</option>
+              <option value="center">По центру</option>
+              <option value="bottom">Внизу, над субтитрами</option>
+              <option value="top">Вверху</option>
+            </select>
+          </Field>
+
           <Field label="Затемнение подложки, %" hint="0 — без подложки">
             <input
               className={inputClass}

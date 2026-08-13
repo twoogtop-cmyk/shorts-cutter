@@ -41,6 +41,9 @@ class RenderRequest:
     outro_duration: float = 3.0
     outro_font_size: int = 64
     outro_bg_opacity: float = 60.0
+    outro_position: str = "auto"
+    # Заполняется по данным слежения за лицами перед сборкой фильтров.
+    outro_free_zone: tuple[float, float] | None = None
     work_dir: Path | None = None
 
 
@@ -65,6 +68,44 @@ def _escape_drawtext(text: str) -> str:
         .replace("'", "’")
         .replace("%", "\\%").replace(",", "\\,")
     )
+
+
+def _outro_top(
+    request: RenderRequest,
+    out_height: int,
+    box_height: int,
+    banner_height: int,
+) -> int:
+    """Вертикальная позиция финальной плашки.
+
+    В режиме auto плашка уходит в свободную от лиц часть кадра: по центру
+    она слишком часто закрывает лицо говорящего.
+    """
+    subtitles_top = out_height - int(subtitles.SAFE_BOTTOM_MARGIN * out_height / OUT_HEIGHT) - box_height
+    lowest = subtitles_top - int(out_height * 0.03)
+    highest = banner_height + int(out_height * 0.04)
+    centered = (out_height - box_height) // 2
+
+    position = (request.outro_position or "auto").lower()
+    if position == "center":
+        return centered
+    if position == "top":
+        return highest
+    if position == "bottom":
+        return max(highest, lowest)
+
+    zone = request.outro_free_zone
+    if zone is None:
+        return centered
+
+    zone_top = banner_height + zone[0] * (out_height - banner_height)
+    zone_bottom = banner_height + zone[1] * (out_height - banner_height)
+    if zone_bottom - zone_top < box_height:
+        # Свободного места меньше плашки — ставим её ниже лиц, к субтитрам.
+        return max(highest, lowest)
+
+    top = int(zone_top + (zone_bottom - zone_top - box_height) / 2)
+    return max(highest, min(lowest, top))
 
 
 def build_video_chain(
@@ -162,7 +203,7 @@ def build_filter_complex(
         longest = max(len(line) for line in outro_lines)
         box_width = min(out_width - int(out_width * 0.08), int(longest * font_size * 0.58) + padding * 2)
         box_height = line_height * len(outro_lines) + padding * 2
-        top = (out_height - box_height) // 2
+        top = _outro_top(request, out_height, box_height, banner_height)
 
         chain = []
         if box_alpha > 0:
@@ -212,7 +253,7 @@ def render_clip(
         video_height = out_height - banner_height
         crop_width = min(int(source_height * out_width / video_height), source_width)
 
-        track, faces_too_wide = faces.detect_face_track(
+        track, faces_too_wide, face_bands = faces.detect_face_track(
             request.source,
             request.start,
             request.end,
@@ -220,6 +261,14 @@ def render_clip(
             frame_width=source_width,
             should_cancel=should_cancel,
         )
+        if request.outro_text.strip() and (request.outro_position or "auto") == "auto":
+            request.outro_free_zone = faces.free_vertical_zone(
+                face_bands, since=max(0.0, duration - request.outro_duration)
+            )
+            if on_log and request.outro_free_zone:
+                zone = request.outro_free_zone
+                on_log(f"плашка ставится в свободную зону {zone[0]:.0%}–{zone[1]:.0%} высоты")
+
         if faces_too_wide:
             # Говорящие не помещаются в вертикальное окно — обрезка потеряет
             # кого-то из них, поэтому показываем кадр целиком с размытым фоном.

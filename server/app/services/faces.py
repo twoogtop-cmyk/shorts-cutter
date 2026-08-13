@@ -40,20 +40,20 @@ def detect_face_track(
     crop_width: int,
     frame_width: int,
     should_cancel=None,
-) -> tuple[list[tuple[float, float]], bool]:
-    """Возвращает траекторию центра кадрирования и признак «лица не помещаются».
+) -> tuple[list[tuple[float, float]], bool, list[tuple[float, float, float]]]:
+    """Возвращает траекторию кадрирования, признак «лица не помещаются» и полосы лиц.
 
     Траектория — список пар (время от начала фрагмента, центр по X).
     Второй элемент равен True, когда лица в кадре разнесены шире окна
     кадрирования: тогда обрезка неизбежно потеряет кого-то из говорящих.
     """
     if not model_available():
-        return [], False
+        return [], False, []
 
     net = _load_net()
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
-        return [], False
+        return [], False, []
 
     step = 1.0 / SAMPLE_FPS
     duration = end - start
@@ -61,6 +61,8 @@ def detect_face_track(
     too_wide_frames = 0
     frames_with_faces = 0
     last_center = frame_width / 2
+    # Вертикальные границы лиц нужны, чтобы финальная плашка не легла на лицо.
+    bands: list[tuple[float, float, float]] = []
 
     try:
         t = 0.0
@@ -80,14 +82,18 @@ def detect_face_track(
             detections = net.forward()
 
             faces: list[tuple[float, float, float]] = []  # центр X, вес, ширина
+            tops: list[float] = []
+            bottoms: list[float] = []
             for i in range(detections.shape[2]):
                 confidence = float(detections[0, 0, i, 2])
                 if confidence < CONFIDENCE:
                     continue
                 box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
-                x1, _, x2, _ = box
+                x1, y1, x2, y2 = box
                 face_width = max(1.0, float(x2 - x1))
                 faces.append(((float(x1) + float(x2)) / 2, confidence * face_width, face_width))
+                tops.append(float(y1) / height)
+                bottoms.append(float(y2) / height)
 
             if faces:
                 frames_with_faces += 1
@@ -98,6 +104,7 @@ def detect_face_track(
                 if right - left > crop_width:
                     too_wide_frames += 1
                 last_center = center
+                bands.append((round(t, 2), round(min(tops), 3), round(max(bottoms), 3)))
             else:
                 center = last_center
 
@@ -107,7 +114,7 @@ def detect_face_track(
         capture.release()
 
     faces_too_wide = frames_with_faces > 0 and too_wide_frames / frames_with_faces > 0.5
-    return smooth_track(track, crop_width, frame_width), faces_too_wide
+    return smooth_track(track, crop_width, frame_width), faces_too_wide, bands
 
 
 def smooth_track(
@@ -196,3 +203,25 @@ def describe_track(track: list[tuple[float, float]]) -> dict[str, Any]:
         "max": round(max(values)),
         "span": round(max(values) - min(values)),
     }
+
+
+def free_vertical_zone(
+    bands: list[tuple[float, float, float]],
+    since: float,
+) -> tuple[float, float] | None:
+    """Ищет свободную от лиц полосу кадра начиная с момента since.
+
+    Возвращает долю высоты (от, до) — куда можно положить плашку, не закрыв лицо.
+    Если лиц в этом отрезке нет, возвращает None: место любое.
+    """
+    relevant = [b for b in bands if b[0] >= since]
+    if not relevant:
+        return None
+
+    top = min(b[1] for b in relevant)
+    bottom = max(b[2] for b in relevant)
+    above = top
+    below = 1.0 - bottom
+    if below >= above:
+        return (bottom, 1.0)
+    return (0.0, top)
