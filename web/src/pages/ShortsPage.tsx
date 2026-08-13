@@ -1,12 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import {
-  api,
-  formatTimecode,
-  watchJob,
-  type Candidate,
-  type Job,
-  type Video,
-} from '../api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { api, formatTimecode, watchJob, type Candidate, type Job, type Video } from '../api'
 import { Button, ErrorBox, Panel } from '../components/ui'
 
 const FILTERS = [
@@ -14,7 +7,16 @@ const FILTERS = [
   { key: 'candidate', label: 'Новые' },
   { key: 'approved', label: 'Одобрено' },
   { key: 'rejected', label: 'Отклонено' },
+  { key: 'ready', label: 'Готовы к скачиванию' },
 ]
+
+const STATUS_LABELS: Record<string, { text: string; color: string }> = {
+  approved: { text: 'одобрен', color: 'var(--color-ok)' },
+  rejected: { text: 'отклонён', color: 'var(--color-bad)' },
+  rendering: { text: 'рендерится', color: 'var(--color-accent)' },
+  ready: { text: 'готов', color: 'var(--color-ok)' },
+  downloaded: { text: 'скачан', color: 'var(--color-accent)' },
+}
 
 function ScoreBar({ label, value }: { label: string; value: number | null }) {
   const v = value ?? 0
@@ -30,18 +32,25 @@ function ScoreBar({ label, value }: { label: string; value: number | null }) {
   )
 }
 
-/** Проигрывает нужный отрезок исходника: превью-файлы появятся на этапе рендера. */
-function RangePlayer({ src, start, end }: { src: string; start: number; end: number }) {
+/** Показывает готовый шортс, а пока его нет — нужный отрезок исходника. */
+function ClipPlayer({
+  candidate,
+  sourceUrl,
+}: {
+  candidate: Candidate
+  sourceUrl: string | null
+}) {
   const ref = useRef<HTMLVideoElement>(null)
+  const clip = candidate.render_url || candidate.preview_url
 
   useEffect(() => {
     const player = ref.current
-    if (!player) return
+    if (!player || clip) return
     const onLoaded = () => {
-      player.currentTime = start
+      player.currentTime = candidate.start
     }
     const onTime = () => {
-      if (player.currentTime >= end) player.pause()
+      if (player.currentTime >= candidate.end) player.pause()
     }
     player.addEventListener('loadedmetadata', onLoaded)
     player.addEventListener('timeupdate', onTime)
@@ -49,16 +58,32 @@ function RangePlayer({ src, start, end }: { src: string; start: number; end: num
       player.removeEventListener('loadedmetadata', onLoaded)
       player.removeEventListener('timeupdate', onTime)
     }
-  }, [start, end])
+  }, [clip, candidate.start, candidate.end])
 
+  if (clip) {
+    return (
+      <video
+        ref={ref}
+        controls
+        preload="metadata"
+        className="w-full max-w-[260px] rounded-lg bg-black aspect-[9/16] mx-auto"
+        src={encodeURI(clip)}
+      />
+    )
+  }
+
+  if (!sourceUrl) return null
   return (
-    <video
-      ref={ref}
-      controls
-      preload="metadata"
-      className="w-full rounded-lg bg-black aspect-video"
-      src={`${encodeURI(src)}#t=${start}`}
-    />
+    <div className="space-y-1.5">
+      <video
+        ref={ref}
+        controls
+        preload="metadata"
+        className="w-full rounded-lg bg-black aspect-video"
+        src={`${encodeURI(sourceUrl)}#t=${candidate.start}`}
+      />
+      <p className="text-xs text-neutral-500">Фрагмент исходника — вертикальный ролик ещё не готов</p>
+    </div>
   )
 }
 
@@ -67,15 +92,14 @@ export function ShortsPage() {
   const [videoId, setVideoId] = useState<number | null>(null)
   const [items, setItems] = useState<Candidate[]>([])
   const [filter, setFilter] = useState('all')
+  const [selected, setSelected] = useState<Set<number>>(new Set())
   const [error, setError] = useState<string | null>(null)
   const [job, setJob] = useState<Job | null>(null)
+  const [busy, setBusy] = useState(false)
   const unwatch = useRef<() => void>(() => {})
 
   const load = useCallback((id: number) => {
-    api
-      .listCandidates(id)
-      .then(setItems)
-      .catch((e) => setError(String(e.message ?? e)))
+    api.listCandidates(id).then(setItems).catch((e) => setError(String(e.message ?? e)))
   }, [])
 
   useEffect(() => {
@@ -94,7 +118,40 @@ export function ShortsPage() {
   }, [videoId, load])
 
   const video = videos.find((v) => v.id === videoId) ?? null
-  const shown = filter === 'all' ? items : items.filter((c) => c.status === filter)
+  const shown = useMemo(
+    () => (filter === 'all' ? items : items.filter((c) => c.status === filter)),
+    [items, filter],
+  )
+
+  const allShownSelected = shown.length > 0 && shown.every((c) => selected.has(c.id))
+
+  const toggle = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }
+
+  const toggleAll = () => {
+    setSelected((prev) => {
+      if (allShownSelected) {
+        const next = new Set(prev)
+        shown.forEach((c) => next.delete(c.id))
+        return next
+      }
+      return new Set([...prev, ...shown.map((c) => c.id)])
+    })
+  }
+
+  const watch = (jobId: number) => {
+    unwatch.current()
+    unwatch.current = watchJob(jobId, (j) => {
+      setJob(j)
+      if (['done', 'failed', 'canceled'].includes(j.status) && videoId != null) load(videoId)
+    })
+    setJob({ id: jobId, status: 'queued', progress: 0 } as Job)
+  }
 
   const setStatus = async (candidate: Candidate, status: string) => {
     setItems((prev) => prev.map((c) => (c.id === candidate.id ? { ...c, status } : c)))
@@ -106,20 +163,63 @@ export function ShortsPage() {
     }
   }
 
-  const runSearch = async () => {
-    if (videoId == null) return
+  const withBusy = async (fn: () => Promise<unknown>) => {
+    setBusy(true)
     setError(null)
     try {
-      const { job_id } = await api.findMoments(videoId)
-      unwatch.current()
-      unwatch.current = watchJob(job_id, (j) => {
-        setJob(j)
-        if (j.status === 'done') load(videoId)
-      })
-      setJob({ id: job_id, status: 'queued', progress: 0 } as Job)
+      await fn()
     } catch (e) {
       setError(String((e as Error).message ?? e))
+    } finally {
+      setBusy(false)
+      if (videoId != null) load(videoId)
     }
+  }
+
+  const ids = [...selected]
+
+  const bulkStatus = (status: string) =>
+    withBusy(async () => {
+      await api.bulkCandidates(ids, status)
+      setSelected(new Set())
+    })
+
+  const bulkDelete = () =>
+    withBusy(async () => {
+      if (!confirm(`Удалить выбранные шортсы (${ids.length})? Файлы будут стёрты.`)) return
+      for (const id of ids) await api.deleteCandidate(id)
+      setSelected(new Set())
+    })
+
+  const bulkRender = () =>
+    withBusy(async () => {
+      const res = await api.renderBulk(ids)
+      if (res.job_ids.length) watch(res.job_ids[res.job_ids.length - 1])
+    })
+
+  const bulkDownload = async () => {
+    const ready = items.filter((c) => selected.has(c.id) && c.render_url)
+    if (!ready.length) {
+      setError('Среди выбранных нет готовых файлов — сначала нажмите «Отрендерить»')
+      return
+    }
+    const response = await fetch('/api/candidates/download-zip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ready.map((c) => c.id) }),
+    })
+    if (!response.ok) {
+      setError(await response.text())
+      return
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'shorts.zip'
+    link.click()
+    URL.revokeObjectURL(url)
+    if (videoId != null) load(videoId)
   }
 
   if (!videos.length) {
@@ -153,13 +253,20 @@ export function ShortsPage() {
                 ))}
               </select>
             )}
-            <Button variant="primary" onClick={runSearch} disabled={!!running}>
-              {running ? `Ищем… ${job?.progress ?? 0}%` : 'Искать моменты'}
+            <Button
+              variant="primary"
+              onClick={() =>
+                videoId != null &&
+                withBusy(async () => watch((await api.findMoments(videoId)).job_id))
+              }
+              disabled={!!running || busy}
+            >
+              {running ? `Работаем… ${job?.progress ?? 0}%` : 'Искать моменты'}
             </Button>
           </div>
         }
       >
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           {FILTERS.map((f) => {
             const count =
               f.key === 'all' ? items.length : items.filter((c) => c.status === f.key).length
@@ -179,76 +286,132 @@ export function ShortsPage() {
           })}
         </div>
 
+        {running && (
+          <p className="mt-3 text-xs text-[var(--color-accent)]">
+            {job?.stage_title ?? 'Обработка'} · {job?.progress ?? 0}%
+          </p>
+        )}
         {job?.status === 'failed' && (
           <p className="mt-3 text-xs text-[var(--color-bad)]">{job.error}</p>
         )}
       </Panel>
 
-      {shown.map((candidate) => (
-        <Panel
-          key={candidate.id}
-          title={
-            <span className="flex items-center gap-2">
-              <span
-                className={`text-sm font-semibold ${
-                  (candidate.total_score ?? 0) >= 80
-                    ? 'text-[var(--color-ok)]'
-                    : 'text-[var(--color-warn)]'
-                }`}
-              >
-                {candidate.total_score ?? '—'}
-              </span>
-              <span className="text-neutral-200">{candidate.title || 'Без названия'}</span>
-              {candidate.status === 'approved' && (
-                <span className="text-xs text-[var(--color-ok)]">одобрен</span>
-              )}
-              {candidate.status === 'rejected' && (
-                <span className="text-xs text-[var(--color-bad)]">отклонён</span>
-              )}
-            </span>
-          }
-          actions={
-            <div className="flex gap-2">
-              <Button variant="ok" onClick={() => setStatus(candidate, 'approved')}>
-                Одобрить
-              </Button>
-              <Button variant="danger" onClick={() => setStatus(candidate, 'rejected')}>
-                Отклонить
-              </Button>
-            </div>
-          }
-        >
-          <div className="grid lg:grid-cols-[400px_1fr] gap-6">
-            <div className="space-y-3">
-              {video?.media_url && (
-                <RangePlayer src={video.media_url} start={candidate.start} end={candidate.end} />
-              )}
-              <div className="text-xs text-neutral-400">
-                {formatTimecode(candidate.start)} → {formatTimecode(candidate.end)} ·{' '}
-                {Math.round(candidate.duration)} сек · {candidate.category}
-              </div>
-              <div className="space-y-1.5">
-                <ScoreBar label="Зацепка" value={candidate.hook_score} />
-                <ScoreBar label="Удержание" value={candidate.retention_score} />
-                <ScoreBar label="Понятность" value={candidate.context_score} />
-                <ScoreBar label="Эмоции" value={candidate.emotion_score} />
-                <ScoreBar label="Финал" value={candidate.ending_score} />
-              </div>
-            </div>
+      {shown.length > 0 && (
+        <div className="sticky top-2 z-10 rounded-xl border border-[var(--color-line)] bg-[var(--color-panel)]/95 backdrop-blur px-4 py-3 flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="w-4 h-4 accent-[var(--color-accent)]"
+              checked={allShownSelected}
+              onChange={toggleAll}
+            />
+            Выбрать все
+          </label>
+          <span className="text-xs text-neutral-500">Выбрано: {selected.size}</span>
 
-            <div className="space-y-3 min-w-0">
-              {candidate.ai_reason && (
-                <p className="text-sm text-neutral-300 leading-relaxed">{candidate.ai_reason}</p>
-              )}
-              {candidate.transcript_text && (
-                <pre className="text-xs text-neutral-400 whitespace-pre-wrap font-sans leading-relaxed max-h-[280px] overflow-y-auto">
-                  {candidate.transcript_text}
-                </pre>
-              )}
-            </div>
+          <div className="flex flex-wrap gap-2 ml-auto">
+            <Button variant="ok" onClick={() => bulkStatus('approved')} disabled={!ids.length || busy}>
+              Одобрить
+            </Button>
+            <Button variant="default" onClick={bulkRender} disabled={!ids.length || busy}>
+              Отрендерить
+            </Button>
+            <Button variant="primary" onClick={bulkDownload} disabled={!ids.length || busy}>
+              Скачать ZIP
+            </Button>
+            <Button variant="danger" onClick={bulkDelete} disabled={!ids.length || busy}>
+              Удалить
+            </Button>
           </div>
-        </Panel>
-      ))}
+        </div>
+      )}
+
+      {shown.map((candidate) => {
+        const badge = STATUS_LABELS[candidate.status]
+        return (
+          <Panel
+            key={candidate.id}
+            title={
+              <span className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-[var(--color-accent)]"
+                  checked={selected.has(candidate.id)}
+                  onChange={() => toggle(candidate.id)}
+                />
+                <span
+                  className={`text-sm font-semibold ${
+                    (candidate.total_score ?? 0) >= 80
+                      ? 'text-[var(--color-ok)]'
+                      : 'text-[var(--color-warn)]'
+                  }`}
+                >
+                  {candidate.total_score ?? '—'}
+                </span>
+                <span className="text-neutral-200">{candidate.title || 'Без названия'}</span>
+                {badge && (
+                  <span className="text-xs" style={{ color: badge.color }}>
+                    {badge.text}
+                  </span>
+                )}
+              </span>
+            }
+            actions={
+              <div className="flex flex-wrap gap-2">
+                <Button variant="ok" onClick={() => setStatus(candidate, 'approved')}>
+                  Одобрить
+                </Button>
+                <Button variant="danger" onClick={() => setStatus(candidate, 'rejected')}>
+                  Отклонить
+                </Button>
+                {candidate.render_url ? (
+                  <a href={api.downloadUrl(candidate.id)} download>
+                    <Button variant="primary">Скачать</Button>
+                  </a>
+                ) : (
+                  <Button
+                    variant="default"
+                    onClick={() =>
+                      withBusy(async () => watch((await api.renderFinal(candidate.id)).job_id))
+                    }
+                    disabled={busy || candidate.status === 'rendering'}
+                  >
+                    Отрендерить
+                  </Button>
+                )}
+              </div>
+            }
+          >
+            <div className="grid lg:grid-cols-[320px_1fr] gap-6">
+              <div className="space-y-3">
+                <ClipPlayer candidate={candidate} sourceUrl={video?.media_url ?? null} />
+                <div className="text-xs text-neutral-400">
+                  {formatTimecode(candidate.start)} → {formatTimecode(candidate.end)} ·{' '}
+                  {Math.round(candidate.duration)} сек · {candidate.category}
+                </div>
+                <div className="space-y-1.5">
+                  <ScoreBar label="Зацепка" value={candidate.hook_score} />
+                  <ScoreBar label="Удержание" value={candidate.retention_score} />
+                  <ScoreBar label="Понятность" value={candidate.context_score} />
+                  <ScoreBar label="Эмоции" value={candidate.emotion_score} />
+                  <ScoreBar label="Финал" value={candidate.ending_score} />
+                </div>
+              </div>
+
+              <div className="space-y-3 min-w-0">
+                {candidate.ai_reason && (
+                  <p className="text-sm text-neutral-300 leading-relaxed">{candidate.ai_reason}</p>
+                )}
+                {candidate.transcript_text && (
+                  <pre className="text-xs text-neutral-400 whitespace-pre-wrap font-sans leading-relaxed max-h-[260px] overflow-y-auto">
+                    {candidate.transcript_text}
+                  </pre>
+                )}
+              </div>
+            </div>
+          </Panel>
+        )
+      })}
 
       {shown.length === 0 && (
         <p className="text-sm text-neutral-500 px-1">

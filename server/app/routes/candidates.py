@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import secrets
+import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
+from ..config import TMP_DIR
 from ..db import execute, insert, query, query_one
 from ..services import analysis, queue
 
@@ -149,6 +154,97 @@ def create_manual(payload: dict) -> dict:
         (video_id, start, end, str(payload.get("title") or "Выбранный фрагмент")[:120], transcript_text),
     )
     return candidate_dict(query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,)))
+
+
+@router.post("/{candidate_id}/render")
+def render_final(candidate_id: int) -> dict:
+    """Ставит в очередь финальный рендер в полном качестве."""
+    row = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    if row is None:
+        raise HTTPException(404, "Момент не найден")
+    if query_one(
+        "SELECT id FROM jobs WHERE candidate_id=? AND type='render_final' "
+        "AND status IN ('queued','running')",
+        (candidate_id,),
+    ):
+        raise HTTPException(409, "Рендер этого момента уже идёт")
+
+    job_id = queue.enqueue("render_final", video_id=row["video_id"], candidate_id=candidate_id)
+    return {"job_id": job_id}
+
+
+@router.post("/render-bulk")
+def render_bulk(payload: dict) -> dict:
+    """Финальный рендер нескольких моментов — очередь выполнит их по очереди."""
+    ids = [int(i) for i in payload.get("ids", [])]
+    if not ids:
+        raise HTTPException(400, "Не выбрано ни одного момента")
+
+    queued = []
+    for candidate_id in ids:
+        row = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+        if row is None or row["render_path"]:
+            continue
+        if query_one(
+            "SELECT id FROM jobs WHERE candidate_id=? AND type='render_final' "
+            "AND status IN ('queued','running')",
+            (candidate_id,),
+        ):
+            continue
+        queued.append(queue.enqueue("render_final", video_id=row["video_id"], candidate_id=candidate_id))
+    return {"queued": len(queued), "job_ids": queued}
+
+
+@router.get("/{candidate_id}/download")
+def download(candidate_id: int) -> FileResponse:
+    """Отдаёт готовый файл шортса."""
+    row = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    if row is None:
+        raise HTTPException(404, "Момент не найден")
+
+    path = Path(row["render_path"] or "")
+    if not path.exists():
+        raise HTTPException(400, "Финальный файл ещё не готов — сначала запустите рендер")
+
+    execute("UPDATE candidates SET status='downloaded' WHERE id=? AND status='ready'", (candidate_id,))
+    return FileResponse(path, media_type="video/mp4", filename=_download_name(row))
+
+
+def _download_name(row) -> str:
+    """Имя файла для скачивания: номер и название момента латиницей."""
+    title = (row["title"] or "short").strip()
+    translit = str.maketrans(
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+        "abvgdeejziyklmnoprstufhccss_y_eua",
+    )
+    slug = title.lower().translate(translit)
+    slug = re.sub(r"[^a-z0-9]+", "_", slug).strip("_")[:50] or "short"
+    return f"short_{row['id']:03d}_{slug}.mp4"
+
+
+@router.post("/download-zip")
+def download_zip(payload: dict) -> FileResponse:
+    """Собирает архив из выбранных готовых шортсов."""
+    ids = [int(i) for i in payload.get("ids", [])]
+    if not ids:
+        raise HTTPException(400, "Не выбрано ни одного момента")
+
+    placeholders = ",".join("?" * len(ids))
+    rows = query(
+        f"SELECT * FROM candidates WHERE id IN ({placeholders}) AND render_path IS NOT NULL",
+        ids,
+    )
+    ready = [r for r in rows if Path(r["render_path"]).exists()]
+    if not ready:
+        raise HTTPException(400, "Среди выбранных нет готовых файлов")
+
+    archive = TMP_DIR / f"shorts_{len(ready)}_{secrets.token_hex(4)}.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as zf:
+        for row in ready:
+            zf.write(row["render_path"], arcname=_download_name(row))
+            execute("UPDATE candidates SET status='downloaded' WHERE id=? AND status='ready'", (row["id"],))
+
+    return FileResponse(archive, media_type="application/zip", filename="shorts.zip")
 
 
 @router.post("/find/{video_id}")

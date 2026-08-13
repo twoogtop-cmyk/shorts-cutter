@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import AUDIO_DIR, STT_CHUNK_SECONDS, TMP_DIR
+from .config import AUDIO_DIR, PREVIEWS_DIR, RENDERS_DIR, STT_CHUNK_SECONDS, TMP_DIR
 from .db import execute, get_settings, insert, query, query_one
-from .services import analysis, ffmpeg, genapi, queue, stt
+from .services import analysis, ffmpeg, genapi, queue, render, stt
 from .registry import register
 
 
@@ -282,11 +282,175 @@ def handle_find_moments(job: dict[str, Any]) -> None:
         if not query_one("SELECT 1 FROM scenes WHERE video_id=? LIMIT 1", (video_id,)):
             run_scene_detection(video_id, job_id)
         run_ai_analysis(video_id, job_id)
-        _set_status(video_id, "analyzed")
-        queue.set_progress(job_id, 100, "ai_analysis")
+        run_previews(video_id, job_id)
+        _set_status(video_id, "completed")
     except Exception as exc:
         _set_status(video_id, "transcribed", str(exc)[:1000])
         raise
+
+
+def _banner_for(candidate: dict[str, Any], settings: dict[str, str]) -> Path | None:
+    banner_id = candidate.get("banner_id") or settings.get("banner_id") or ""
+    if not banner_id:
+        return None
+    row = query_one("SELECT path FROM banners WHERE id=?", (int(banner_id),))
+    if row is None:
+        return None
+    path = Path(row["path"])
+    return path if path.exists() else None
+
+
+def _build_request(candidate: dict[str, Any], video: dict[str, Any], kind: str) -> render.RenderRequest:
+    """Собирает параметры рендера: настройки шортса важнее общих настроек."""
+    settings = get_settings()
+
+    def pick(key: str, default: str) -> str:
+        value = candidate.get(key)
+        if value in (None, ""):
+            value = settings.get(key, default)
+        return str(value)
+
+    subtitles_on = pick("subtitles_enabled", "1") not in ("0", "", "None")
+    words: list[dict[str, Any]] = []
+    if subtitles_on:
+        words = [
+            dict(r)
+            for r in query(
+                "SELECT start, end, text FROM words WHERE video_id=? AND start >= ? AND end <= ? "
+                "ORDER BY start",
+                (video["id"], candidate["start"], candidate["end"]),
+            )
+        ]
+
+    outro_on = pick("outro_enabled", "0") not in ("0", "", "None")
+    outro_text = candidate.get("outro_text") or settings.get("outro_text", "")
+
+    target_dir = PREVIEWS_DIR if kind == "preview" else RENDERS_DIR
+    suffix = "preview" if kind == "preview" else "final"
+    target = target_dir / f"short_{candidate['id']}_{suffix}.mp4"
+
+    profile = "preview" if kind == "preview" else settings.get("quality_profile", "high")
+
+    return render.RenderRequest(
+        source=Path(video["storage_path"]),
+        target=target,
+        start=float(candidate["start"]),
+        end=float(candidate["end"]),
+        profile=profile,
+        crop_mode=pick("crop_mode", "smart"),
+        subtitle_words=words,
+        subtitle_style=pick("subtitle_style", "dynamic"),
+        banner_path=_banner_for(candidate, settings),
+        banner_mode=settings.get("banner_mode", "separate_top"),
+        banner_height_percent=float(settings.get("banner_height_percent", 18)),
+        banner_opacity=float(settings.get("banner_opacity", 100)),
+        outro_text=outro_text if outro_on else "",
+        outro_duration=float(settings.get("outro_duration", 3)),
+        outro_font_size=int(float(settings.get("outro_font_size", 64))),
+        outro_bg_opacity=float(settings.get("outro_bg_opacity", 60)),
+        work_dir=TMP_DIR,
+    )
+
+
+def run_render(candidate_id: int, job_id: int, kind: str) -> Path:
+    """Рендерит один шортс: дешёвое превью или финал в полном качестве."""
+    candidate = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    if candidate is None:
+        raise RuntimeError("Момент не найден")
+    candidate = dict(candidate)
+
+    video = _video(candidate["video_id"])
+    if not video["storage_path"] or not Path(video["storage_path"]).exists():
+        raise RuntimeError("Исходное видео удалено — рендер невозможен")
+
+    request = _build_request(candidate, video, kind)
+    queue.set_progress(job_id, 0, "rendering")
+    queue.log(job_id, f"{'превью' if kind == 'preview' else 'финал'}: {candidate['title'] or candidate_id}")
+
+    render_id = insert(
+        "INSERT INTO renders(candidate_id, kind, resolution, crf, preset, crop_mode, "
+        "subtitle_style, file_path, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+        (
+            candidate_id, kind,
+            f"{render.PROFILES[request.profile]['width']}x{render.PROFILES[request.profile]['height']}",
+            render.PROFILES[request.profile]["crf"], render.PROFILES[request.profile]["preset"],
+            request.crop_mode, request.subtitle_style, str(request.target),
+        ),
+    )
+
+    try:
+        render.render_clip(
+            request,
+            on_progress=lambda frac: queue.set_progress(job_id, int(frac * 100), "rendering"),
+            on_log=lambda msg: queue.log(job_id, msg),
+            should_cancel=lambda: queue.is_cancelled(job_id),
+        )
+    except Exception as exc:
+        execute("UPDATE renders SET status='failed', error=? WHERE id=?", (str(exc)[:2000], render_id))
+        execute("UPDATE candidates SET error=? WHERE id=?", (str(exc)[:1000], candidate_id))
+        raise
+
+    execute("UPDATE renders SET status='done' WHERE id=?", (render_id,))
+    column = "preview_path" if kind == "preview" else "render_path"
+    new_status = candidate["status"] if kind == "preview" else "ready"
+    execute(
+        f"UPDATE candidates SET {column}=?, error=NULL, status=?, updated_at=datetime('now') WHERE id=?",
+        (str(request.target), new_status, candidate_id),
+    )
+    size_mb = request.target.stat().st_size / 1024**2
+    queue.log(job_id, f"файл {request.target.name}: {size_mb:.1f} МБ")
+    return request.target
+
+
+@register("render_preview")
+def handle_render_preview(job: dict[str, Any]) -> None:
+    run_render(int(job["candidate_id"]), job["id"], "preview")
+    queue.set_progress(job["id"], 100, "rendering")
+
+
+@register("render_final")
+def handle_render_final(job: dict[str, Any]) -> None:
+    candidate_id = int(job["candidate_id"])
+    execute("UPDATE candidates SET status='rendering' WHERE id=?", (candidate_id,))
+    try:
+        run_render(candidate_id, job["id"], "final")
+    except Exception:
+        execute("UPDATE candidates SET status='approved' WHERE id=?", (candidate_id,))
+        raise
+    queue.set_progress(job["id"], 100, "rendering")
+
+
+def run_previews(video_id: int, job_id: int) -> int:
+    """Делает превью для всех найденных моментов."""
+    candidates = query(
+        "SELECT id FROM candidates WHERE video_id=? AND status='candidate' AND preview_path IS NULL "
+        "ORDER BY start",
+        (video_id,),
+    )
+    if not candidates:
+        return 0
+
+    _set_status(video_id, "clips_generation")
+    total = len(candidates)
+    for i, row in enumerate(candidates):
+        if queue.is_cancelled(job_id):
+            break
+        queue.set_progress(job_id, int(i / total * 100), "clips_generation")
+        try:
+            run_render(int(row["id"]), job_id, "preview")
+        except Exception as exc:
+            # Один сбойный фрагмент не должен останавливать остальные.
+            queue.log(job_id, f"превью для момента {row['id']} не создано: {exc}", "error")
+    queue.set_progress(job_id, 100, "clips_generation")
+    return total
+
+
+@register("render_previews")
+def handle_render_previews(job: dict[str, Any]) -> None:
+    video_id = job["video_id"]
+    count = run_previews(video_id, job["id"])
+    queue.log(job["id"], f"обработано моментов: {count}")
+    _set_status(video_id, "completed")
 
 
 @register("analyze")
@@ -316,9 +480,12 @@ def handle_analyze(job: dict[str, Any]) -> None:
             return
 
         run_ai_analysis(video_id, job_id)
-        # Нарезка превью подключается на этапе 5.
-        _set_status(video_id, "analyzed")
-        queue.set_progress(job_id, 100, "ai_analysis")
+        if queue.is_cancelled(job_id):
+            _set_status(video_id, "analyzed")
+            return
+
+        run_previews(video_id, job_id)
+        _set_status(video_id, "completed")
     except Exception as exc:
         _set_status(video_id, "failed", str(exc)[:1000])
         raise

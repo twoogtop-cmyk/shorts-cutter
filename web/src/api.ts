@@ -143,6 +143,14 @@ export const api = {
     }),
   deleteCandidate: (id: number) =>
     request<{ ok: boolean }>(`/api/candidates/${id}`, { method: 'DELETE' }),
+  renderFinal: (id: number) =>
+    request<{ job_id: number }>(`/api/candidates/${id}/render`, { method: 'POST' }),
+  renderBulk: (ids: number[]) =>
+    request<{ queued: number; job_ids: number[] }>('/api/candidates/render-bulk', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
+  downloadUrl: (id: number) => `/api/candidates/${id}/download`,
   findMoments: (videoId: number) =>
     request<{ job_id: number }>(`/api/candidates/find/${videoId}`, { method: 'POST' }),
   createManual: (videoId: number, start: number, end: number, title?: string) =>
