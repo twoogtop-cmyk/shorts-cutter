@@ -131,11 +131,12 @@ def build_filter_complex(
         label = "subbed"
 
     if banner_height:
-        # Видео прижато вниз, сверху отдельная полоса под баннер.
+        # Видео прижимается вниз, сверху освобождается полоса под баннер.
+        # Именно pad, а не наложение на сгенерированный фон: у источника color=
+        # своя длительность, и она обрезала бы ролик.
         parts.append(
-            f"color=c=black:s={out_width}x{out_height}:d=1[canvas]"
+            f"[{label}]pad={out_width}:{out_height}:0:{banner_height}:black[stacked]"
         )
-        parts.append(f"[canvas][{label}]overlay=0:{banner_height}:shortest=1[stacked]")
         label = "stacked"
 
     if has_banner:
@@ -146,24 +147,42 @@ def build_filter_complex(
         parts.append(f"[{label}][banner]overlay=0:0[banned]")
         label = "banned"
 
-    if request.outro_text.strip():
+    outro_lines = [l.strip() for l in request.outro_text.strip().splitlines() if l.strip()]
+    if outro_lines:
         duration = request.end - request.start
         outro_start = max(0.0, duration - request.outro_duration)
-        lines = [l.strip() for l in request.outro_text.strip().splitlines() if l.strip()]
-        text = _escape_drawtext("\n".join(lines))
+        enable = f"enable='gte(t\\,{outro_start:.2f})'"
         box_alpha = max(0.0, min(1.0, request.outro_bg_opacity / 100))
         font_size = int(request.outro_font_size * out_width / OUT_WIDTH)
-        draw = (
-            f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"text='{text}':fontcolor=white:fontsize={font_size}:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=12:"
-            f"box=1:boxcolor=black@{box_alpha:.2f}:boxborderw=28:"
-            f"enable='gte(t,{outro_start:.2f})'"
-        )
-        parts.append(f"[{label}]{draw}[outro]")
+        line_height = int(font_size * 1.35)
+        padding = int(font_size * 0.55)
+
+        # Каждая строка рисуется отдельным drawtext: многострочный текст ffmpeg
+        # переносит, но дополнительно рисует сам символ переноса как пустой квадрат.
+        longest = max(len(line) for line in outro_lines)
+        box_width = min(out_width - int(out_width * 0.08), int(longest * font_size * 0.58) + padding * 2)
+        box_height = line_height * len(outro_lines) + padding * 2
+        top = (out_height - box_height) // 2
+
+        chain = []
+        if box_alpha > 0:
+            chain.append(
+                f"drawbox=x=(w-{box_width})/2:y={top}:w={box_width}:h={box_height}:"
+                f"color=black@{box_alpha:.2f}:t=fill:{enable}"
+            )
+        for i, line in enumerate(outro_lines):
+            y = top + padding + i * line_height
+            chain.append(
+                f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                f"text='{_escape_drawtext(line)}':fontcolor=white:fontsize={font_size}:"
+                f"x=(w-text_w)/2:y={y}:{enable}"
+            )
+        parts.append(f"[{label}]{','.join(chain)}[outro]")
         label = "outro"
 
-    return ";".join(parts), label
+    # Единый цветовой формат на выходе — иначе плееры показывают разный контраст.
+    parts.append(f"[{label}]format=yuv420p[out]")
+    return ";".join(parts), "out"
 
 
 def render_clip(
@@ -229,7 +248,8 @@ def render_clip(
         subtitle_file = subtitles.write_ass(work_dir / f"{request.target.stem}.ass", content)
 
     filter_complex, label = build_filter_complex(
-        request, source_width, source_height, crop_expression, subtitle_file, out_width, out_height
+        request, source_width, source_height, crop_expression, subtitle_file,
+        out_width, out_height
     )
 
     args = ["-ss", f"{request.start:.3f}", "-t", f"{duration:.3f}", "-i", str(request.source)]
@@ -244,6 +264,7 @@ def render_clip(
         "-crf", str(profile["crf"]),
         "-preset", profile["preset"],
         "-pix_fmt", "yuv420p",
+        "-color_range", "tv",
         "-profile:v", "high",
         "-c:a", "aac",
         "-b:a", profile["audio"],

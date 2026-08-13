@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, formatBytes, type SystemStatus, type Video } from '../api'
-import { ErrorBox, Panel, Stat } from '../components/ui'
+import { Button, ErrorBox, Panel, Stat } from '../components/ui'
 import { UploadZone } from '../components/UploadZone'
 import { VideoPanel } from '../components/VideoPanel'
 
@@ -8,6 +8,8 @@ export function HomePage() {
   const [status, setStatus] = useState<SystemStatus | null>(null)
   const [videos, setVideos] = useState<Video[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [cleaning, setCleaning] = useState(false)
+  const [cleanupResult, setCleanupResult] = useState<string | null>(null)
 
   const reload = useCallback(() => {
     api.systemStatus().then(setStatus).catch((e) => setError(String(e.message ?? e)))
@@ -19,6 +21,25 @@ export function HomePage() {
     const timer = setInterval(reload, 15000)
     return () => clearInterval(timer)
   }, [reload])
+
+  const runCleanup = async (
+    question: string,
+    action: () => Promise<{ freed_bytes: number }>,
+  ) => {
+    if (!confirm(question)) return
+    setCleaning(true)
+    setError(null)
+    setCleanupResult(null)
+    try {
+      const res = await action()
+      setCleanupResult(`Освобождено ${formatBytes(res.freed_bytes)}`)
+    } catch (e) {
+      setError(String((e as Error).message ?? e))
+    } finally {
+      setCleaning(false)
+      reload()
+    }
+  }
 
   const free = status?.disk.free ?? 0
   const diskTone = free < 1.5 * 1024 ** 3 ? 'bad' : free < 3 * 1024 ** 3 ? 'warn' : 'ok'
@@ -70,6 +91,46 @@ export function HomePage() {
           Загруженных серий пока нет.
         </p>
       )}
+
+      <Panel title="Очистка диска">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            variant="default"
+            disabled={cleaning}
+            onClick={() =>
+              runCleanup(
+                'Удалить отклонённые шортсы и временные файлы?',
+                () => api.cleanup({ rejected: true, previews: true }),
+              )
+            }
+          >
+            Убрать лишнее
+          </Button>
+
+          <Button
+            variant="danger"
+            disabled={cleaning || videos.length === 0}
+            onClick={() =>
+              runCleanup(
+                'Удалить ВСЁ: загруженные серии, все шортсы и рендеры?\n' +
+                  'Скачанные файлы на вашем компьютере не пострадают, но на сервере не останется ничего.',
+                api.deleteAll,
+              )
+            }
+          >
+            Удалить всё
+          </Button>
+
+          {cleanupResult && (
+            <span className="text-xs text-[var(--color-ok)]">{cleanupResult}</span>
+          )}
+        </div>
+        <p className="text-xs text-neutral-500 mt-3">
+          «Убрать лишнее» удаляет отклонённые ролики и превью уже отрендеренных —
+          исходная серия и готовые шортсы остаются. «Удалить всё» освобождает диск
+          полностью: нажимайте после того, как скачали нужные ролики.
+        </p>
+      </Panel>
     </div>
   )
 }

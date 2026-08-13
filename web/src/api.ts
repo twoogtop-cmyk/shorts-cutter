@@ -77,6 +77,16 @@ export type Job = {
   logs?: { ts: string; level: string; message: string }[]
 }
 
+export type Banner = {
+  id: number
+  title: string
+  filename: string
+  width: number | null
+  height: number | null
+  url: string
+  created_at: string
+}
+
 export type Candidate = {
   id: number
   video_id: number
@@ -107,6 +117,16 @@ export const api = {
   getSettings: () => request<Settings>('/api/settings'),
   saveSettings: (values: Settings) =>
     request<Settings>('/api/settings', { method: 'PUT', body: JSON.stringify(values) }),
+
+  cleanup: (options: { rejected?: boolean; previews?: boolean }) =>
+    request<{ freed_bytes: number; removed: Record<string, number> }>('/api/system/cleanup', {
+      method: 'POST',
+      body: JSON.stringify(options),
+    }),
+  deleteAll: () =>
+    request<{ deleted_videos: number; freed_bytes: number }>('/api/videos', { method: 'DELETE' }),
+  deleteVideo: (id: number) =>
+    request<{ freed_bytes: number }>(`/api/videos/${id}`, { method: 'DELETE' }),
 
   listVideos: () => request<Video[]>('/api/videos'),
   getVideo: (id: number) => request<Video>(`/api/videos/${id}`),
@@ -143,6 +163,17 @@ export const api = {
     }),
   deleteCandidate: (id: number) =>
     request<{ ok: boolean }>(`/api/candidates/${id}`, { method: 'DELETE' }),
+  listBanners: () => request<Banner[]>('/api/banners'),
+  uploadBanner: async (file: File): Promise<Banner> => {
+    const form = new FormData()
+    form.append('file', file)
+    const resp = await fetch('/api/banners', { method: 'POST', body: form })
+    if (!resp.ok) throw new Error((await resp.text()).slice(0, 300))
+    return resp.json()
+  },
+  deleteBanner: (id: number) =>
+    request<{ ok: boolean }>(`/api/banners/${id}`, { method: 'DELETE' }),
+
   renderFinal: (id: number) =>
     request<{ job_id: number }>(`/api/candidates/${id}/render`, { method: 'POST' }),
   renderBulk: (ids: number[]) =>

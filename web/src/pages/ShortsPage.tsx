@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, formatTimecode, watchJob, type Candidate, type Job, type Video } from '../api'
+import {
+  api,
+  formatTimecode,
+  watchJob,
+  type Banner,
+  type Candidate,
+  type Job,
+  type Segment,
+  type Video,
+} from '../api'
 import { Button, ErrorBox, Panel } from '../components/ui'
+import { ClipEditor } from '../components/ClipEditor'
 
 const FILTERS = [
   { key: 'all', label: 'Все' },
@@ -96,7 +106,12 @@ export function ShortsPage() {
   const [error, setError] = useState<string | null>(null)
   const [job, setJob] = useState<Job | null>(null)
   const [busy, setBusy] = useState(false)
+  const [banners, setBanners] = useState<Banner[]>([])
+  const [segments, setSegments] = useState<Segment[]>([])
+  const [editing, setEditing] = useState<Candidate | null>(null)
+  const [activeIndex, setActiveIndex] = useState(0)
   const unwatch = useRef<() => void>(() => {})
+  const cardRefs = useRef<Record<number, HTMLDivElement | null>>({})
 
   const load = useCallback((id: number) => {
     api.listCandidates(id).then(setItems).catch((e) => setError(String(e.message ?? e)))
@@ -110,11 +125,17 @@ export function ShortsPage() {
         if (list.length) setVideoId((prev) => prev ?? list[0].id)
       })
       .catch((e) => setError(String(e.message ?? e)))
+    api.listBanners().then(setBanners).catch(() => {})
     return () => unwatch.current()
   }, [])
 
   useEffect(() => {
-    if (videoId != null) load(videoId)
+    if (videoId == null) return
+    load(videoId)
+    api
+      .getTranscript(videoId)
+      .then((t) => setSegments(t.segments))
+      .catch(() => setSegments([]))
   }, [videoId, load])
 
   const video = videos.find((v) => v.id === videoId) ?? null
@@ -124,6 +145,71 @@ export function ShortsPage() {
   )
 
   const allShownSelected = shown.length > 0 && shown.every((c) => selected.has(c.id))
+
+  // Быстрая модерация с клавиатуры: смотреть десятки роликов мышью долго.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      if (editing) return
+      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+
+      const current = shown[activeIndex]
+      const move = (delta: number) => {
+        const next = Math.max(0, Math.min(shown.length - 1, activeIndex + delta))
+        setActiveIndex(next)
+        const card = shown[next] && cardRefs.current[shown[next].id]
+        card?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+
+      switch (e.key.toLowerCase()) {
+        case 'arrowdown':
+        case 'arrowright':
+          e.preventDefault()
+          move(1)
+          break
+        case 'arrowup':
+        case 'arrowleft':
+          e.preventDefault()
+          move(-1)
+          break
+        case ' ': {
+          e.preventDefault()
+          if (!current) break
+          const card = cardRefs.current[current.id]
+          const player = card?.querySelector('video')
+          if (player) player.paused ? player.play() : player.pause()
+          break
+        }
+        case 'a':
+        case 'ф':
+          if (current) setStatus(current, 'approved')
+          break
+        case 'r':
+        case 'к':
+          if (current) setStatus(current, 'rejected')
+          break
+        case 'e':
+        case 'у':
+          if (current) setEditing(current)
+          break
+        case 'd':
+        case 'в':
+          if (current?.render_url) window.location.href = api.downloadUrl(current.id)
+          break
+        case 'x':
+        case 'ч':
+          if (current) toggle(current.id)
+          break
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [shown, activeIndex, editing])
+
+  useEffect(() => {
+    if (activeIndex >= shown.length) setActiveIndex(Math.max(0, shown.length - 1))
+  }, [shown.length, activeIndex])
 
   const toggle = (id: number) => {
     setSelected((prev) => {
@@ -326,11 +412,20 @@ export function ShortsPage() {
         </div>
       )}
 
-      {shown.map((candidate) => {
+      {shown.map((candidate, index) => {
         const badge = STATUS_LABELS[candidate.status]
         return (
-          <Panel
+          <div
             key={candidate.id}
+            ref={(el) => {
+              cardRefs.current[candidate.id] = el
+            }}
+            onClick={() => setActiveIndex(index)}
+            className={`rounded-xl transition-shadow ${
+              index === activeIndex ? 'ring-2 ring-[var(--color-accent)]/60' : ''
+            }`}
+          >
+          <Panel
             title={
               <span className="flex items-center gap-2">
                 <input
@@ -363,6 +458,9 @@ export function ShortsPage() {
                 </Button>
                 <Button variant="danger" onClick={() => setStatus(candidate, 'rejected')}>
                   Отклонить
+                </Button>
+                <Button variant="default" onClick={() => setEditing(candidate)}>
+                  Редактировать
                 </Button>
                 {candidate.render_url ? (
                   <a href={api.downloadUrl(candidate.id)} download>
@@ -410,6 +508,7 @@ export function ShortsPage() {
               </div>
             </div>
           </Panel>
+          </div>
         )
       })}
 
@@ -419,6 +518,23 @@ export function ShortsPage() {
             ? 'Моментов пока нет — распознайте речь и нажмите «Искать моменты».'
             : 'В этой категории пусто.'}
         </p>
+      )}
+
+      {shown.length > 0 && (
+        <p className="text-xs text-neutral-600 px-1 pb-4">
+          Горячие клавиши: ↑↓ — переход, Пробел — воспроизведение, A — одобрить, R — отклонить,
+          E — редактировать, D — скачать, X — отметить галочкой
+        </p>
+      )}
+
+      {editing && (
+        <ClipEditor
+          candidate={editing}
+          segments={segments}
+          banners={banners}
+          onClose={() => setEditing(null)}
+          onSaved={() => videoId != null && load(videoId)}
+        />
       )}
     </div>
   )
