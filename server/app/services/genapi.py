@@ -112,7 +112,9 @@ def transcribe_file(
 def chat(
     messages: list[dict[str, str]],
     model: str | None = None,
-    max_tokens: int = 16000,
+    # Сервис резервирует деньги по максимуму ответа, поэтому завышенный лимит
+    # блокирует запрос при живом балансе. 6000 токенов хватает на ~25 моментов.
+    max_tokens: int = 6000,
     temperature: float = 0.3,
     timeout: float = 600,
 ) -> str:
@@ -128,6 +130,12 @@ def chat(
         resp = client.post(
             f"{GENAPI_PROXY}/chat/completions", headers=_headers(), json=body
         )
+        if resp.status_code == 402:
+            raise GenApiError(
+                "Недостаточно средств на счёте gen-api для анализа. "
+                "Пополните баланс — транскрипция уже сохранена, "
+                "повторный поиск моментов её не оплачивает."
+            )
         if resp.status_code >= 400:
             raise GenApiError(f"LLM: HTTP {resp.status_code} {resp.text[:300]}")
         data = resp.json()

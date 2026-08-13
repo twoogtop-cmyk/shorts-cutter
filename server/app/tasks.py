@@ -255,6 +255,27 @@ def run_ai_analysis(video_id: int, job_id: int) -> int:
     queue.set_progress(job_id, 80, "ai_analysis")
     execute("DELETE FROM candidates WHERE video_id=? AND origin='ai' AND status='candidate'", (video_id,))
 
+    # Одобренные и отрендеренные моменты не удаляются, поэтому новые кандидаты
+    # сверяются и с ними: иначе один и тот же фрагмент появится дважды.
+    kept = [
+        {"start": r["start"], "end": r["end"]}
+        for r in query("SELECT start, end FROM candidates WHERE video_id=?", (video_id,))
+    ]
+    fresh = []
+    for moment in moments:
+        overlaps = False
+        for existing in kept:
+            overlap = min(moment["end"], existing["end"]) - max(moment["start"], existing["start"])
+            shorter = min(moment["end"] - moment["start"], existing["end"] - existing["start"])
+            if overlap > 0 and shorter > 0 and overlap / shorter >= 0.5:
+                overlaps = True
+                break
+        if overlaps:
+            queue.log(job_id, f"пропущен дубль уже сохранённого момента на {moment['start']:.0f} с")
+            continue
+        fresh.append(moment)
+    moments = fresh
+
     for moment in moments:
         insert(
             "INSERT INTO candidates(video_id, start, end, title, category, hook_score, "
@@ -352,7 +373,7 @@ def _build_request(candidate: dict[str, Any], video: dict[str, Any], kind: str) 
     )
 
 
-def run_render(candidate_id: int, job_id: int, kind: str) -> Path:
+def run_render(candidate_id: int, job_id: int, kind: str, report_progress: bool = True) -> Path:
     """Рендерит один шортс: дешёвое превью или финал в полном качестве."""
     candidate = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
     if candidate is None:
@@ -364,7 +385,8 @@ def run_render(candidate_id: int, job_id: int, kind: str) -> Path:
         raise RuntimeError("Исходное видео удалено — рендер невозможен")
 
     request = _build_request(candidate, video, kind)
-    queue.set_progress(job_id, 0, "rendering")
+    if report_progress:
+        queue.set_progress(job_id, 0, "rendering")
     queue.log(job_id, f"{'превью' if kind == 'preview' else 'финал'}: {candidate['title'] or candidate_id}")
 
     render_id = insert(
@@ -381,7 +403,11 @@ def run_render(candidate_id: int, job_id: int, kind: str) -> Path:
     try:
         render.render_clip(
             request,
-            on_progress=lambda frac: queue.set_progress(job_id, int(frac * 100), "rendering"),
+            on_progress=(
+                (lambda frac: queue.set_progress(job_id, int(frac * 100), "rendering"))
+                if report_progress
+                else None
+            ),
             on_log=lambda msg: queue.log(job_id, msg),
             should_cancel=lambda: queue.is_cancelled(job_id),
         )
@@ -437,7 +463,7 @@ def run_previews(video_id: int, job_id: int) -> int:
             break
         queue.set_progress(job_id, int(i / total * 100), "clips_generation")
         try:
-            run_render(int(row["id"]), job_id, "preview")
+            run_render(int(row["id"]), job_id, "preview", report_progress=False)
         except Exception as exc:
             # Один сбойный фрагмент не должен останавливать остальные.
             queue.log(job_id, f"превью для момента {row['id']} не создано: {exc}", "error")
@@ -474,7 +500,12 @@ def handle_analyze(job: dict[str, Any]) -> None:
             _set_status(video_id, "audio_ready")
             return
 
-        run_scene_detection(video_id, job_id)
+        # Склейки не зависят от транскрипции: если они уже посчитаны,
+        # повторный проход по всей серии — впустую потраченные минуты.
+        if query_one("SELECT 1 FROM scenes WHERE video_id=? LIMIT 1", (video_id,)):
+            queue.log(job_id, "склейки уже найдены, пропускаем поиск сцен")
+        else:
+            run_scene_detection(video_id, job_id)
         if queue.is_cancelled(job_id):
             _set_status(video_id, "transcribed")
             return
