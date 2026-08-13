@@ -49,11 +49,21 @@ function StageList({ job }: { job: Job | null }) {
   )
 }
 
+/** Распознавание тарифицируется поминутно, анализ — примерная оценка. */
+function estimateCost(durationSeconds: number | null): { stt: number; ai: number; total: number } {
+  const minutes = Math.ceil((durationSeconds ?? 0) / 60)
+  const stt = minutes * 2
+  const ai = 20
+  return { stt, ai, total: stt + ai }
+}
+
 export function VideoPanel({
   video,
+  balance,
   onChanged,
 }: {
   video: Video
+  balance: number | null
   onChanged: () => void
 }) {
   const [job, setJob] = useState<Job | null>(null)
@@ -68,7 +78,7 @@ export function VideoPanel({
       .listJobs(video.id)
       .then((jobs) => {
         if (!alive) return
-        const relevant = jobs.find((j) => j.type === 'analyze') ?? jobs[0] ?? null
+        const relevant = jobs.find((j) => j.type === 'analyze') ?? null
         setJob(relevant)
         if (relevant && ['queued', 'running'].includes(relevant.status)) {
           unwatch.current = watchJob(relevant.id, (j) => {
@@ -100,6 +110,7 @@ export function VideoPanel({
   }
 
   const running = job && ['queued', 'running'].includes(job.status)
+  const cost = estimateCost(video.duration)
 
   return (
     <Panel
@@ -160,6 +171,26 @@ export function VideoPanel({
 
         <div>
           <StageList job={job} />
+
+          {!running && job?.status !== 'done' && (
+            <div className="mt-4 rounded-lg bg-[var(--color-panel-2)] px-3 py-2.5 text-xs space-y-1">
+              <div className="text-neutral-400">
+                Обработка обойдётся примерно в{' '}
+                <span className="text-neutral-200">{cost.total} ₽</span>{' '}
+                <span className="text-neutral-500">
+                  (распознавание {cost.stt} ₽ + анализ ~{cost.ai} ₽)
+                </span>
+              </div>
+              {balance != null && balance < cost.total && (
+                <div className="text-[var(--color-warn)]">
+                  На счёте {balance.toFixed(0)} ₽ — не хватает {Math.ceil(cost.total - balance)} ₽.
+                  Распознавание пройдёт, но на поиск моментов средств не останется.
+                  Транскрипция сохранится: после пополнения поиск обойдётся всего в ~{cost.ai} ₽.
+                </div>
+              )}
+            </div>
+          )}
+
           {job?.status === 'failed' && (
             <div className="mt-3 rounded-lg border border-[var(--color-bad)]/40 bg-[var(--color-bad)]/10 px-3 py-2 text-xs text-[#ffb4b8]">
               <div className="mb-2">{job.error}</div>

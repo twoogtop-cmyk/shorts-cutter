@@ -83,7 +83,7 @@ export function HomePage() {
       </Panel>
 
       {videos.map((video) => (
-        <VideoPanel key={video.id} video={video} onChanged={reload} />
+        <VideoPanel key={video.id} video={video} balance={status?.balance ?? null} onChanged={reload} />
       ))}
 
       {videos.length === 0 && (

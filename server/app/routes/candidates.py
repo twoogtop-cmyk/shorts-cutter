@@ -19,6 +19,23 @@ router = APIRouter(prefix="/candidates", tags=["candidates"])
 ALLOWED_STATUSES = {"candidate", "approved", "rejected", "editing", "rendering", "ready", "downloaded"}
 
 
+def _queue_final_render(row) -> int | None:
+    """Ставит финальный рендер, если файла ещё нет и задача не запущена.
+
+    Одобрение означает «ролик нужен», поэтому полное качество готовится сразу —
+    иначе пришлось бы жать ещё одну кнопку и ждать.
+    """
+    if row["render_path"] and Path(row["render_path"]).exists():
+        return None
+    if query_one(
+        "SELECT id FROM jobs WHERE candidate_id=? AND type='render_final' "
+        "AND status IN ('queued','running')",
+        (row["id"],),
+    ):
+        return None
+    return queue.enqueue("render_final", video_id=row["video_id"], candidate_id=row["id"])
+
+
 def candidate_dict(row) -> dict:
     data = dict(row)
     data["duration"] = round(data["end"] - data["start"], 2)
@@ -93,7 +110,14 @@ def update_candidate(candidate_id: int, payload: dict) -> dict:
         f"UPDATE candidates SET {assignments}, updated_at=datetime('now') WHERE id=?",
         (*fields.values(), candidate_id),
     )
-    return candidate_dict(query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,)))
+
+    updated = query_one("SELECT * FROM candidates WHERE id=?", (candidate_id,))
+    result = candidate_dict(updated)
+    if fields.get("status") == "approved":
+        job_id = _queue_final_render(updated)
+        if job_id:
+            result["render_job_id"] = job_id
+    return result
 
 
 @router.post("/bulk")
@@ -110,7 +134,14 @@ def bulk_update(payload: dict) -> dict:
         f"UPDATE candidates SET status=?, updated_at=datetime('now') WHERE id IN ({placeholders})",
         (status, *ids),
     )
-    return {"updated": len(ids), "status": status}
+
+    queued: list[int] = []
+    if status == "approved":
+        for row in query(f"SELECT * FROM candidates WHERE id IN ({placeholders})", ids):
+            job_id = _queue_final_render(row)
+            if job_id:
+                queued.append(job_id)
+    return {"updated": len(ids), "status": status, "queued_renders": len(queued)}
 
 
 @router.delete("/{candidate_id}")
