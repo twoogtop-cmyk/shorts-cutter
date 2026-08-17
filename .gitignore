@@ -11,3 +11,4 @@ web/dist/
 *.mov
 *.avi
 *.webm
+.DS_Store

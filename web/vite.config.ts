@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 
 // В dev-режиме фронт работает локально, а /api и /media проксируются
 // на сервер — отдельный локальный backend поднимать не нужно.
-const SERVER = process.env.SC_SERVER_URL || 'http://83.166.244.157'
+const SERVER = process.env.SC_SERVER_URL || 'http://localhost:8000'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

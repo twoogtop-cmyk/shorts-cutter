@@ -3,7 +3,7 @@
 # локально (на сервере 1 ГБ RAM — сборка там невозможна) и уезжает статикой.
 set -euo pipefail
 
-SERVER="${SC_SERVER:-root@83.166.244.157}"
+SERVER="${SC_SERVER:?укажите сервер: export SC_SERVER=root@ваш-ip}"
 APP_DIR=/opt/shorts-cutter
 
 cd "$(dirname "$0")"
